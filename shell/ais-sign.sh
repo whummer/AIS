@@ -15,6 +15,7 @@
 
 # CUSTOMER used to identify to AIS (provided by Swisscom)
 CUSTOMER="IAM-Test"
+CUSTOMER=Advanon.com
 KEY_STATIC="kp1-iam-signer"
 KEY_ONDEMAND="OnDemand-Advanced"
 
@@ -38,11 +39,13 @@ error()
 MSGTYPE=SOAP                                    # Default is SOAP
 DEBUG=
 VERBOSE=
-while getopts "dvt:" opt; do
+PENDING=
+while getopts "dvpt:" opt; do
   case $opt in
     t) MSGTYPE=$OPTARG ;;
     d) DEBUG=1 ;;
-    v) VERBOSE=1 ;; 
+    v) VERBOSE=1 ;;
+    p) PENDING=1 ;;
   esac
 done
 
@@ -53,6 +56,7 @@ if [ $# -lt 3 ]; then                           # Parse the rest of the argument
   echo "  -t value   - message type (SOAP, XML, JSON), default SOAP"
   echo "  -v         - verbose output"
   echo "  -d         - debug mode"
+  echo "  -p         - send PendingRequest instead of SignRequest"
   echo "  file       - file to be signed"
   echo "  method     - digest method (SHA256, SHA384, SHA512)"
   echo "  pkcs7      - output file with detached PKCS#7 (Cryptographic Message Syntax) signature"
@@ -67,7 +71,7 @@ if [ $# -lt 3 ]; then                           # Parse the rest of the argument
   echo "          $0 -v -t JSON myfile.txt SHA256 result.p7s 'cn=Hans Muster,o=ACME,c=CH'"
   echo "          $0 -v myfile.txt SHA256 myfile.p7s 'cn=Hans Muster,c=CH' +41792080350"
   echo "          $0 -v myfile.txt SHA256 myfile.p7s 'cn=Hans Muster,c=CH' +41792080350 'test.com: Sign it? (#TRANSID#)' en"
-  echo 
+  echo
   exit 1
 fi
 
@@ -112,8 +116,15 @@ DIGEST_VALUE=$(openssl dgst -binary -$DIGEST_METHOD $FILE | openssl enc -base64 
 PKCS7_RESULT=$3
 [ -f "$PKCS7_RESULT" ] && error "Target file $PKCS7_RESULT already exists"
 
+echo PENDING $PENDING
+if [ "$PENDING" = "1" ]; then
+  ONDEMAND_DN=1
+  RESPONSE_ID=$4
+fi
+
 # OnDemand subject distinguished name
 ONDEMAND_DN=$4
+# echo ONDEMAND_DN $ONDEMAND_DN
 
 # Set Claimed ID (customer name + key entity)
 [ -n "$ONDEMAND_DN" ] && CLAIMED_ID=$CUSTOMER:$KEY_ONDEMAND || CLAIMED_ID=$CUSTOMER:$KEY_STATIC
@@ -125,7 +136,7 @@ MID_MSISDN=$5                                   # MSISDN
 if [ -n "$MID_MSISDN" ]; then                   # MobileID step up
   # Generate a unique transaction id
   TRANSID=$(LC_CTYPE=C tr -dc A-Za-z0-9 < /dev/urandom | head -c 6)
-  
+
   # Optional Mobile ID message (with unique transaction id, if requested)
   MID_MSG=$(echo $6 | sed -e "s/#TRANSID#/${TRANSID}/g")
   [ ! -n "$MID_MSG" ] && MID_MSG="Sign it? (${TRANSID})"
@@ -135,20 +146,19 @@ if [ -n "$MID_MSISDN" ]; then                   # MobileID step up
   [ ! -n "$MID_LANG" ] && MID_LANG="EN"
 
   case "$MSGTYPE" in
-    SOAP|XML) 
+    SOAP|XML)
       MID='
         <sc:StepUpAuthorisation>
-            <sc:MobileID Type="http://ais.swisscom.ch/1.0/auth/mobileid/1.0">
+            <sc:Phone>
                 <sc:MSISDN>'$MID_MSISDN'</sc:MSISDN>
                 <sc:Message>'$MID_MSG'</sc:Message>
                 <sc:Language>'$MID_LANG'</sc:Language>
-            </sc:MobileID>
+            </sc:Phone>
         </sc:StepUpAuthorisation>' ;;
-    JSON) 
+    JSON)
       MID='
         "sc.StepUpAuthorisation": {
-            "sc.MobileID": {
-                "@Type": "http://ais.swisscom.ch/1.0/auth/mobileid/1.0",
+            "sc.Phone": {
                 "sc.MSISDN": "'$MID_MSISDN'",
                 "sc.Message": "'$MID_MSG'",
                 "sc.Language": "'$MID_LANG'"
@@ -160,34 +170,40 @@ fi
 # Optional On-Demand certificate signature
 if [ -n "$ONDEMAND_DN" ]; then
   case "$MSGTYPE" in
-    SOAP|XML) 
+    SOAP|XML)
       ONDEMAND='
         <AdditionalProfile>http://ais.swisscom.ch/1.0/profiles/ondemandcertificate</AdditionalProfile>
+        <AdditionalProfile>urn:oasis:names:tc:dss:1.0:profiles:asynchronousprocessing</AdditionalProfile>
+        <AdditionalProfile>http://ais.swisscom.ch/1.1/profiles/redirect</AdditionalProfile>
         <sc:CertificateRequest>
             '$MID'
             <sc:DistinguishedName>'$ONDEMAND_DN'</sc:DistinguishedName>
         </sc:CertificateRequest>' ;;
-    JSON) 
+    JSON)
       ONDEMAND='
-        "AdditionalProfile": "http://ais.swisscom.ch/1.0/profiles/ondemandcertificate", 
+        "AdditionalProfile": "http://ais.swisscom.ch/1.0/profiles/ondemandcertificate",
         "sc.CertificateRequest": {
             '$MID'
-            "sc.DistinguishedName": "'$ONDEMAND_DN'" 
+            "sc.DistinguishedName": "'$ONDEMAND_DN'"
         },' ;;
   esac
 fi
+
+# echo $ONDEMAND
+
+PROFILE_VERSION=1.1
 
 case "$MSGTYPE" in
   # MessageType is SOAP. Define the Request
   SOAP)
     REQ_SOAP='
-      <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"                  
+      <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                      xmlns:ais="http://service.ais.swisscom.com/">
           <soap:Body>
               <ais:sign>
-                  <SignRequest RequestID="'$REQUESTID'" Profile="http://ais.swisscom.ch/1.0"
+                  <SignRequest RequestID="'$REQUESTID'" Profile="http://ais.swisscom.ch/'$PROFILE_VERSION'"
                                xmlns="urn:oasis:names:tc:dss:1.0:core:schema"
-                               xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"   
+                               xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"
                                xmlns:sc="http://ais.swisscom.ch/1.0/schema">
                       <OptionalInputs>
                           <ClaimedIdentity>
@@ -214,9 +230,9 @@ case "$MSGTYPE" in
   # MessageType is XML. Define the Request
   XML)
     REQ_XML='
-      <SignRequest RequestID="'$REQUESTID'" Profile="http://ais.swisscom.ch/1.0" 
+      <SignRequest RequestID="'$REQUESTID'" Profile="http://ais.swisscom.ch/'$PROFILE_VERSION'"
                    xmlns="urn:oasis:names:tc:dss:1.0:core:schema"
-                   xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"   
+                   xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"
                    xmlns:sc="http://ais.swisscom.ch/1.0/schema">
           <OptionalInputs>
               <ClaimedIdentity>
@@ -236,13 +252,13 @@ case "$MSGTYPE" in
       </SignRequest>'
     # store into file
     echo "$REQ_XML" > $TMP.req ;;
-    
+
   # MessageType is JSON. Define the Request
   JSON)
     REQ_JSON='{
       "SignRequest": {
           "@RequestID": "'$REQUESTID'",
-          "@Profile": "http://ais.swisscom.ch/1.0",
+          "@Profile": "http://ais.swisscom.ch/'$PROFILE_VERSION'",
           "OptionalInputs": {
               "ClaimedIdentity": {
                   "Name": "'$CLAIMED_ID'"
@@ -254,17 +270,44 @@ case "$MSGTYPE" in
           },
           "InputDocuments": {"DocumentHash": {
               "dsig.DigestMethod": {"@Algorithm": "'$DIGEST_ALGO'"},
-              "dsig.DigestValue": "'$DIGEST_VALUE'" 
+              "dsig.DigestValue": "'$DIGEST_VALUE'"
           }}
       }}'
     # store into file
     echo "$REQ_JSON" > $TMP.req ;;
-    
+
   # Unknown message type
   *)
     error "Unsupported message type $MSGTYPE, check with $0" ;;
-    
+
 esac
+
+if [ "$PENDING" = "1" ]; then
+  REQ_SOAP='
+    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+                   xmlns:ais="http://service.ais.swisscom.com/">
+        <soap:Body>
+            <ais:pending>
+                <async:PendingRequest RequestID="'$REQUESTID'" Profile="http://ais.swisscom.ch/'$PROFILE_VERSION'"
+                             xmlns="urn:oasis:names:tc:dss:1.0:core:schema"
+                             xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"
+                             xmlns:async="urn:oasis:names:tc:dss:1.0:profiles:asynchronousprocessing:1.0"
+                             xmlns:sc="http://ais.swisscom.ch/1.0/schema">
+                    <OptionalInputs>
+                        <ClaimedIdentity>
+                            <Name>'$CLAIMED_ID'</Name>
+                        </ClaimedIdentity>
+                        <async:ResponseID>'$RESPONSE_ID'</async:ResponseID>
+                    </OptionalInputs>
+                </async:PendingRequest>
+            </ais:pending>
+        </soap:Body>
+    </soap:Envelope>'
+  # store into file
+  echo "$REQ_SOAP" > $TMP.req
+fi
+
+echo $REQ_SOAP
 
 # Check existence of needed files
 [ -r "${SSL_CA}" ]    || error "CA certificate/chain file ($CERT_CA) missing or not readable"
@@ -299,6 +342,8 @@ http_code=$(curl --write-out '%{http_code}\n' --silent \
   --connect-timeout $TIMEOUT_CON \
   $URL)
 
+cat $TMP.rsp
+
 # Results
 RC=$?
 
@@ -316,7 +361,7 @@ if [ "$RC" = "0" -a "$http_code" = "200" ]; then
       RES_MIN=$(sed -n -e 's/^.*"ResultMinor":"\([^"]*\)".*$/\1/p' $TMP.rsp)
       RES_MSG=$(cat $TMP.rsp | sed 's/\\\//\//g' | sed 's/\\n/ /g' | sed -n -e 's/^.*"ResultMessage":{\([^}]*\)}.*$/\1/p')
       sed -n -e 's/^.*"Base64Signature":{"@Type":"urn:ietf:rfc:3369","$":"\([^"]*\)".*$/\1/p' $TMP.rsp | sed 's/\\//g' > $TMP.sig.base64 ;;
-  esac 
+  esac
 
   if [ -s "${TMP}.sig.base64" ]; then
     # Decode signature if present
@@ -334,7 +379,14 @@ if [ "$RC" = "0" -a "$http_code" = "200" ]; then
       echo " Digest       : $DIGEST_VALUE"
       echo " Result major : $RES_MAJ with exit $RC"
     fi
-   else
+  elif [ "$RES_MAJ" = "urn:oasis:names:tc:dss:1.0:profiles:asynchronousprocessing:resultmajor:Pending" ]; then
+    RC=0                                                # Ok
+    if [ "$VERBOSE" = "1" ]; then                       # Verbose details
+      echo "OK on $FILE with following details:"
+      echo " Digest       : $DIGEST_VALUE"
+      echo " Result major : $RES_MAJ with exit $RC"
+    fi
+  else
     RC=1                                                # Failure
     if [ "$VERBOSE" = "1" ]; then                       # Verbose details
       echo "FAILED on $FILE with following details:"
@@ -358,7 +410,7 @@ fi
 if [ -n "$DEBUG" ]; then
   [ -f "$TMP.req" ] && echo ">>> $TMP.req <<<" && cat $TMP.req | ( [ "$MSGTYPE" != "JSON" ] && xmllint --format - || python -m json.tool )
   [ -f "$TMP.curl.log" ] && echo ">>> $TMP.curl.log <<<" && cat $TMP.curl.log | grep '==\|error'
-  [ -f "$TMP.rsp" ] && echo ">>> $TMP.rsp <<<" && cat $TMP.rsp | ( [ "$MSGTYPE" != "JSON" ] && xmllint --format - || python -m json.tool ) 
+  [ -f "$TMP.rsp" ] && echo ">>> $TMP.rsp <<<" && cat $TMP.rsp | ( [ "$MSGTYPE" != "JSON" ] && xmllint --format - || python -m json.tool )
   echo ""
 fi
 
